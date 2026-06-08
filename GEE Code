@@ -1,0 +1,513 @@
+// ==============================
+// 0. CONFIG
+// ==============================
+
+var TRAIN_YEAR = 2020;
+var CLASSIFY_YEAR = 2022;
+
+var SCALE = 10;
+var EXPORT_FOLDER = 'Bahia_Geospatial_Finance';
+
+var MAX_EXPORTS = 7;
+
+var RF_TREES = 200;
+
+// ==============================
+// 1. TARGET MUNICIPALITIES
+// ==============================
+
+var TARGETS = [
+  'Barreiras',
+  'Correntina',
+  'Jaborandi',
+  'Sao Desiderio',
+  'Formosa Do Rio Preto',
+  'Riachao Das Neves',
+  'Luís Eduardo Magalhães',
+  'Cocos'
+];
+
+var municipios = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.eq('ADM1_NAME', 'Bahia'))
+  .filter(ee.Filter.inList('ADM2_NAME', TARGETS));
+
+print('Municipios:', municipios.aggregate_array('ADM2_NAME').distinct());
+
+// ==============================
+// 2. TRAINING DATA
+// ==============================
+
+var fields = ee.FeatureCollection('projects/geeclass1/assets/LEM_dataset');
+
+function soyLabel(f) {
+
+  var props = [
+    'Jan_2020','Feb_2020','Mar_2020',
+    'Apr_2020','May_2020','Jun_2020'
+  ];
+
+  var soyFlags = ee.List(props).map(function(p) {
+
+    var v = ee.String(
+      ee.Algorithms.If(f.get(p), f.get(p), '')
+    ).toLowerCase();
+
+    return ee.Algorithms.If(
+      v.index('soy').gte(0),
+      1,
+      0
+    );
+  });
+
+  var soySum = ee.Array(soyFlags).reduce('sum', [0]).get([0]);
+
+  return f.set(
+    'soy_ref',
+    ee.Number(soySum).gt(0).int()
+  );
+}
+
+var labeled = fields.map(soyLabel);
+
+var trainingRoi = labeled.geometry().bounds();
+
+// ==============================
+// 3. OPTICAL
+// ==============================
+
+function maskS2(img) {
+
+  var scl = img.select('SCL');
+
+  var valid = scl.eq(4)
+    .or(scl.eq(5))
+    .or(scl.eq(6))
+    .or(scl.eq(7));
+
+  var cloud = img.select('MSK_CLDPRB').lt(40);
+
+  var mask = valid.and(cloud);
+
+  var ndvi = img.normalizedDifference(['B8','B4']).rename('NDVI');
+  var ndwi = img.normalizedDifference(['B8','B11']).rename('NDWI');
+  var ndre = img.normalizedDifference(['B8','B5']).rename('NDRE');
+
+  return img
+    .select(['B4','B5','B8','B11','B12'])
+    .addBands([ndvi, ndwi, ndre])
+    .updateMask(mask);
+}
+
+function getOptical(start, end, roi, reducerType) {
+
+  var col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(roi)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+    .map(maskS2);
+
+  return ee.Image(
+    ee.Algorithms.If(
+      ee.String(reducerType).compareTo('max').eq(0),
+      col.max(),
+      col.median()
+    )
+  );
+}
+
+// ==============================
+// 4. SAR
+// ==============================
+
+function prepSAR(img) {
+
+  var ratio = img.select('VH')
+    .subtract(img.select('VV'))
+    .rename('VH_VV');
+
+  return img.select(['VV','VH']).addBands(ratio);
+}
+
+function getSAR(start, end, roi) {
+
+  return ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(roi)
+    .filterDate(start, end)
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.listContains(
+      'transmitterReceiverPolarisation', 'VV'
+    ))
+    .filter(ee.Filter.listContains(
+      'transmitterReceiverPolarisation', 'VH'
+    ))
+    .map(prepSAR)
+    .median();
+}
+
+// ==============================
+// 5. FEATURE STACK
+// ==============================
+
+function suffix(img, s) {
+
+  return img.rename(
+    img.bandNames().map(function(n) {
+      return ee.String(n).cat('_').cat(s);
+    })
+  );
+}
+
+function buildFeatureStack(year, roi) {
+
+  year = ee.Number(year);
+
+  var prev = year.subtract(1);
+
+  var earlyStart = ee.Date.fromYMD(prev, 10, 1);
+  var earlyEnd   = ee.Date.fromYMD(prev, 12, 31);
+
+  var peakStart  = ee.Date.fromYMD(year, 1, 1);
+  var peakEnd    = ee.Date.fromYMD(year, 3, 31);
+
+  var lateStart  = ee.Date.fromYMD(year, 4, 1);
+  var lateEnd    = ee.Date.fromYMD(year, 6, 30);
+
+  // Optical
+  var optEarly = getOptical(
+    earlyStart, earlyEnd, roi, 'median'
+  );
+
+  var optPeak = getOptical(
+    peakStart, peakEnd, roi, 'max'
+  );
+
+  var optLate = getOptical(
+    lateStart, lateEnd, roi, 'median'
+  );
+
+  // SAR
+  var sarEarly = getSAR(earlyStart, earlyEnd, roi);
+  var sarPeak  = getSAR(peakStart, peakEnd, roi);
+  var sarLate  = getSAR(lateStart, lateEnd, roi);
+
+  // Temporal features
+  var ndviGrowth = optPeak.select('NDVI')
+    .subtract(optEarly.select('NDVI'))
+    .rename('NDVI_Growth');
+
+  var ndviDecline = optPeak.select('NDVI')
+    .subtract(optLate.select('NDVI'))
+    .rename('NDVI_Decline');
+
+  var vhGrowth = sarPeak.select('VH')
+    .subtract(sarEarly.select('VH'))
+    .rename('VH_Growth');
+
+  return ee.Image.cat([
+
+    suffix(optEarly, 'early'),
+    suffix(optPeak, 'peak'),
+    suffix(optLate, 'late'),
+
+    suffix(sarEarly, 'early'),
+    suffix(sarPeak, 'peak'),
+    suffix(sarLate, 'late'),
+
+    ndviGrowth,
+    ndviDecline,
+    vhGrowth
+
+  ]).float();
+}
+
+// ==============================
+// 6. TRAIN RANDOM FOREST
+// ==============================
+
+var featureStack = buildFeatureStack(
+  TRAIN_YEAR,
+  trainingRoi
+);
+
+var bands = featureStack.bandNames();
+
+// --------------------------------------------------
+// SAMPLE POINTS
+// --------------------------------------------------
+
+var sampledFields = labeled.randomColumn('rand', 42);
+
+
+sampledFields = sampledFields.limit(3000);
+
+
+var samplePoints = sampledFields.map(function(f) {
+
+  return ee.Feature(
+    f.geometry().centroid(10),
+    {
+      soy_ref: f.get('soy_ref')
+    }
+  );
+});
+
+// --------------------------------------------------
+// EXTRACT PIXEL VALUES
+// --------------------------------------------------
+
+var training = featureStack.sampleRegions({
+  collection: samplePoints,
+  properties: ['soy_ref'],
+  scale: 10,
+  geometries: false,
+  tileScale: 4
+});
+
+// --------------------------------------------------
+// RANDOM TRAIN/TEST SPLIT
+// --------------------------------------------------
+
+training = training.randomColumn('random', 42);
+
+var trainSet = training.filter(
+  ee.Filter.lt('random', 0.7)
+);
+
+var testSet = training.filter(
+  ee.Filter.gte('random', 0.7)
+);
+
+print('Train size:', trainSet.size());
+print('Test size:', testSet.size());
+
+// --------------------------------------------------
+// RANDOM FOREST
+// --------------------------------------------------
+
+var classifier = ee.Classifier.smileRandomForest({
+    numberOfTrees: 150,
+    minLeafPopulation: 3,
+    bagFraction: 0.7,
+    maxNodes: 1000,
+    seed: 42
+  })
+  .setOutputMode('PROBABILITY')
+  .train({
+    features: trainSet,
+    classProperty: 'soy_ref',
+    inputProperties: bands
+  });
+// ==============================
+// 7. THRESHOLD OPTIMIZATION
+// ==============================
+
+var predicted = testSet.classify(
+  classifier,
+  'probability'
+);
+
+var thresholds = ee.List.sequence(0.35, 0.75, 0.05);
+
+var metrics = ee.FeatureCollection(
+
+  thresholds.map(function(t) {
+
+    t = ee.Number(t);
+
+    var classified = predicted.map(function(f) {
+      return f.set(
+        'pred',
+        ee.Number(f.get('probability')).gt(t)
+      );
+    });
+
+    var cm = classified.errorMatrix(
+      'soy_ref',
+      'pred'
+    );
+
+    return ee.Feature(null, {
+      threshold: t,
+      kappa: cm.kappa(),
+      accuracy: cm.accuracy()
+    });
+  })
+);
+
+var best = metrics
+  .sort('kappa', false)
+  .first();
+
+var THRESHOLD = ee.Number(
+  best.get('threshold')
+);
+
+print('Optimal Threshold:', THRESHOLD);
+print('Metrics:', best);
+
+// ==============================
+// 8. DEFORESTATION MASK
+// ==============================
+
+function getDeforestationMask(year, roi) {
+
+  year = ee.Number(year);
+
+  var histYears = ee.List.sequence(1, 3);
+
+  var hist = ee.ImageCollection.fromImages(
+
+    histYears.map(function(yOffset) {
+
+      var y = year.subtract(yOffset);
+
+      return getOptical(
+        ee.Date.fromYMD(y,1,1),
+        ee.Date.fromYMD(y,12,31),
+        roi,
+        'median'
+      ).select('NDVI');
+    })
+  );
+
+  var baseline = hist.median();
+
+  var mad = hist.map(function(i) {
+    return i.subtract(baseline).abs();
+  }).median();
+
+  var robustStd = mad.multiply(1.4826).max(0.05);
+
+  var current = getOptical(
+    ee.Date.fromYMD(year,1,1),
+    ee.Date.fromYMD(year,12,31),
+    roi,
+    'median'
+  ).select('NDVI');
+
+  var next = getOptical(
+    ee.Date.fromYMD(year.add(1),1,1),
+    ee.Date.fromYMD(year.add(1),12,31),
+    roi,
+    'median'
+  ).select('NDVI');
+
+  var z = current.subtract(baseline)
+    .divide(robustStd);
+
+  var vhBaseline = ee.ImageCollection.fromImages(
+
+    histYears.map(function(yOffset) {
+
+      var y = year.subtract(yOffset);
+
+      return getSAR(
+        ee.Date.fromYMD(y,1,1),
+        ee.Date.fromYMD(y,12,31),
+        roi
+      ).select('VH');
+    })
+
+  ).median();
+
+  var vhCurrent = getSAR(
+    ee.Date.fromYMD(year,1,1),
+    ee.Date.fromYMD(year,12,31),
+    roi
+  ).select('VH');
+
+  var mask = baseline.gt(0.4)
+    .and(z.lt(-2.5))
+    .and(current.lt(baseline.subtract(0.2)))
+    .and(next.lt(baseline.subtract(0.2)))
+    .and(vhCurrent.subtract(vhBaseline).lt(-1.5));
+
+  return mask
+    .selfMask()
+    .updateMask(
+      mask.connectedPixelCount(100, true).gte(20)
+    );
+}
+
+// ==============================
+// 9. EXPORT LOOP
+// ==============================
+
+var names = municipios
+  .aggregate_array('ADM2_NAME')
+  .distinct()
+  .sort();
+
+names.evaluate(function(list) {
+
+  var limit = Math.min(
+    list.length,
+    MAX_EXPORTS
+  );
+
+  print('Creating', limit, 'exports');
+
+  for (var i = 0; i < limit; i++) {
+
+    var name = list[i];
+
+    var roi = municipios
+      .filter(ee.Filter.eq('ADM2_NAME', name));
+
+    var geom = roi.geometry();
+
+    var stack = buildFeatureStack(
+      CLASSIFY_YEAR,
+      geom
+    );
+
+    var prob = stack.classify(
+      classifier,
+      'probability'
+    );
+
+    var soy = prob
+      .gt(THRESHOLD)
+      .selfMask();
+
+    var defor = getDeforestationMask(
+      CLASSIFY_YEAR,
+      geom
+    );
+
+    var forestToSoy = soy
+      .updateMask(defor)
+      .clip(geom);
+
+    var safe = name.replace(
+      /[^a-zA-Z0-9]/g,
+      '_'
+    );
+
+    // Export 1
+    Export.image.toDrive({
+      image: soy.clip(geom).uint8(),
+      description:
+        'Bahia_Soy_2022_' + safe,
+      folder: EXPORT_FOLDER,
+      region: geom,
+      scale: SCALE,
+      crs: 'EPSG:4326',
+      maxPixels: 1e13
+    });
+
+    // Export 2
+    Export.image.toDrive({
+      image: forestToSoy.uint8(),
+      description:
+        'Bahia_ForestToSoy_2022_' + safe,
+      folder: EXPORT_FOLDER,
+      region: geom,
+      scale: SCALE,
+      crs: 'EPSG:4326',
+      maxPixels: 1e13
+    });
+  }
+
+  print('ALL EXPORT TASKS GENERATED');
+});
